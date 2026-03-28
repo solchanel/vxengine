@@ -11,6 +11,7 @@
 
 #include "vxengine/lua_bindings.h"
 #include "vxengine/engine.h"
+#include "../src/behavior_report.h"
 #include "vxengine/memory.h"
 #include "vxengine/cpu/icpu.h"
 #include "vxengine/cpu/x86/x86_cpu.h"
@@ -560,6 +561,59 @@ void register_lua_bindings(sol::state& lua, VXEngine* engine) {
     vx.set_function("watch_table", [engine](uint64_t addr, size_t count,
                                              sol::optional<size_t> entry_size) {
         engine->watch_table(addr, count, entry_size.value_or(4));
+    });
+
+    // Behavior report: export JSON to file
+    vx.set_function("report", [engine](const std::string& path) -> bool {
+        return engine->report().export_json(path);
+    });
+
+    // Behavior report: get JSON string
+    vx.set_function("report_json", [engine]() -> std::string {
+        return engine->report().to_json();
+    });
+
+    // VFS: add a fake file
+    vx.set_function("vfs_add_file", [engine](const std::string& path,
+                                              const std::string& content) {
+        engine->vfs().add_file(path, content);
+    });
+
+    // VFS: map a virtual path to a host file
+    vx.set_function("vfs_map", [engine](const std::string& vpath,
+                                         const std::string& hpath) {
+        engine->vfs().map_host_file(vpath, hpath);
+    });
+
+    // Shellcode loader: load from file
+    vx.set_function("load_shellcode", [engine](const std::string& path,
+                                                sol::optional<uint64_t> base) {
+        engine->load_shellcode(path, base.value_or(0));
+    });
+
+    // Auto-unpack: detect OEP and dump
+    vx.set_function("auto_unpack", [engine](const std::string& dump_path) -> bool {
+        return engine->auto_unpack(dump_path);
+    });
+
+    // Export exerciser: call all DLL exports
+    vx.set_function("exercise_exports", [engine, &lua]() -> sol::table {
+        auto results = engine->exercise_exports();
+        sol::table tbl = lua.create_table();
+        for (size_t i = 0; i < results.size(); ++i) {
+            sol::table entry = lua.create_table();
+            entry["name"] = results[i].name;
+            entry["address"] = results[i].address;
+            entry["completed"] = results[i].completed;
+            tbl[i + 1] = entry;
+        }
+        return tbl;
+    });
+
+    // PE writer: export for debugger
+    vx.set_function("export_usermode", [engine](const std::string& path,
+                                                 sol::optional<uint64_t> oep) -> bool {
+        return engine->export_for_debugger(path, oep.value_or(0));
     });
 
     // Run a Lua script

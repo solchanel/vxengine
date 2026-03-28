@@ -23,6 +23,7 @@
 #include <vector>
 #include <memory>
 #include <functional>
+#include <optional>
 #include <unordered_map>
 
 // Forward declare sol::state
@@ -33,6 +34,21 @@ namespace vx {
 #ifdef VX_ENABLE_Z3
 class Solver;
 #endif
+
+class BehaviorReport;
+class Registry;
+class VirtualFileSystem;
+class Unpacker;
+class PEWriter;
+
+/// Result of exercising a single DLL export
+struct ExportResult {
+    std::string name;
+    uint64_t address = 0;
+    bool completed = false;
+    uint64_t insn_count = 0;
+    StopReason stop_reason = StopReason::NONE;
+};
 
 /// Windows environment stub (TEB/PEB/GDT/heap setup)
 class WindowsEnvironment {
@@ -97,6 +113,13 @@ private:
 
     /// Default handler for unregistered APIs
     uint64_t default_handler(const std::string& dll, const std::string& func);
+
+public:
+    /// Set behavior report for auto-logging API calls
+    void set_report(BehaviorReport* report) { report_ = report; }
+
+private:
+    BehaviorReport* report_ = nullptr;
 };
 
 /// Main VXEngine class
@@ -116,6 +139,10 @@ public:
     /// Run DllMain / entry point initialization
     void run_dll_init(LoadedModule& mod);
 
+    /// Load raw shellcode into the engine
+    LoadedModule load_shellcode(const std::string& path, uint64_t base = 0);
+    LoadedModule load_shellcode_bytes(const uint8_t* data, size_t size, uint64_t base = 0);
+
     // ===== Execution =====
 
     /// Call a function at addr with the given arguments (pushed to stack)
@@ -131,6 +158,17 @@ public:
 
     /// Watch a handler table: set watchpoints on each entry
     void watch_table(uint64_t addr, size_t count, size_t entry_size = 4);
+
+    // ===== Advanced features =====
+
+    /// Auto-unpack: detect OEP and dump unpacked PE
+    bool auto_unpack(const std::string& dump_path);
+
+    /// Exercise all DLL exports with default args
+    std::vector<ExportResult> exercise_exports();
+
+    /// Export current memory state as debuggable PE
+    bool export_for_debugger(const std::string& path, uint64_t oep = 0);
 
     // ===== Scripting =====
 
@@ -149,6 +187,9 @@ public:
     PELoader& loader() { return loader_; }
     Tracer& tracer() { return tracer_; }
     APIDispatcher& api() { return api_; }
+    BehaviorReport& report();
+    Registry& registry();
+    VirtualFileSystem& vfs();
     sol::state& lua();
     Arch arch() const { return arch_; }
 
@@ -169,6 +210,10 @@ private:
     APIDispatcher api_;
     Tracer tracer_;
     std::unique_ptr<sol::state> lua_;
+    std::unique_ptr<BehaviorReport> report_;
+    std::unique_ptr<Registry> registry_;
+    std::unique_ptr<VirtualFileSystem> vfs_;
+    std::optional<LoadedModule> loaded_mod_;  // Currently loaded module
     bool lua_initialized_ = false;
 
 #ifdef VX_ENABLE_Z3

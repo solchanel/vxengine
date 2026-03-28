@@ -210,4 +210,7 @@ void register_extended_apis(APIDispatcher& disp);
 /// Register ntdll APIs, syscall interceptor, and device I/O handlers
 void register_ntdll_apis(APIDispatcher& disp);
 
+/// Register ws2_32.dll Winsock API stubs for network behavior analysis
+void register_ws2_32_apis(APIDispatcher& api);
+
 } // namespace vx

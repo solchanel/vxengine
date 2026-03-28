@@ -12,6 +12,11 @@
 #include "vxengine/engine.h"
 #include "vxengine/lua_bindings.h"
 #include "vxengine/cpu/x86/x86_cpu.h"
+#include "../src/behavior_report.h"
+#include "../src/registry.h"
+#include "../src/vfs.h"
+#include "../src/unpacker.h"
+#include "../src/pe_writer.h"
 #ifdef VX_ENABLE_Z3
 #include "vxengine/solver.h"
 #endif
@@ -26,6 +31,20 @@
 namespace fs = std::filesystem;
 
 namespace vx {
+
+// Forward declarations for API registration functions
+void register_advapi32_apis(APIDispatcher& api, Registry& reg);
+void register_advapi32_security_apis(APIDispatcher& api);
+void register_ws2_32_apis(APIDispatcher& api);
+void register_wininet_apis(APIDispatcher& api);
+void register_winhttp_apis(APIDispatcher& api);
+void register_user32_apis(APIDispatcher& api);
+void register_crypt32_apis(APIDispatcher& api);
+void register_ole32_apis(APIDispatcher& api);
+void register_vfs_apis(APIDispatcher& api, VirtualFileSystem& vfs);
+void register_hal_apis(APIDispatcher& api);
+void register_fltmgr_apis(APIDispatcher& api);
+void register_cng_apis(APIDispatcher& api);
 
 // ============================================================
 // WindowsEnvironment
@@ -152,6 +171,11 @@ bool APIDispatcher::dispatch(uint64_t sentinel_addr) {
         }
     }
 
+    // Record API call in behavior report
+    if (report_) {
+        report_->record_api(dll, func, retval);
+    }
+
     // Set return value (EAX for x86-32)
     cpu_.set_reg(X86_EAX, retval);
 
@@ -208,6 +232,16 @@ VXEngine::VXEngine(Arch arch)
     // Set up Windows environment (TEB, PEB, GDT, stack, heap)
     winenv_->setup(arch);
 
+    // Initialize behavior report and attach to API dispatcher
+    report_ = std::make_unique<BehaviorReport>();
+    api_.set_report(report_.get());
+
+    // Initialize in-memory registry hive
+    registry_ = std::make_unique<Registry>();
+
+    // Initialize virtual filesystem
+    vfs_ = std::make_unique<VirtualFileSystem>();
+
 #ifdef VX_ENABLE_Z3
     solver_ = std::make_unique<Solver>();
     tracer_.attach_solver(solver_.get());
@@ -215,6 +249,10 @@ VXEngine::VXEngine(Arch arch)
 }
 
 VXEngine::~VXEngine() = default;
+
+BehaviorReport& VXEngine::report() { return *report_; }
+Registry& VXEngine::registry() { return *registry_; }
+VirtualFileSystem& VXEngine::vfs() { return *vfs_; }
 
 // ============================================================
 // Loading
@@ -230,6 +268,31 @@ LoadedModule VXEngine::load(const std::string& path) {
 
     // Bind sentinel map for API dispatch
     api_.bind_sentinels(loader_.sentinel_map());
+
+    // Register advapi32 registry API handlers
+    register_advapi32_apis(api_, *registry_);
+
+    // Register ws2_32 network API stubs
+    register_ws2_32_apis(api_);
+
+    // Register VFS-backed file API handlers
+    register_vfs_apis(api_, *vfs_);
+
+    // Register additional usermode DLL stubs
+    register_advapi32_security_apis(api_);
+    register_wininet_apis(api_);
+    register_winhttp_apis(api_);
+    register_user32_apis(api_);
+    register_crypt32_apis(api_);
+    register_ole32_apis(api_);
+
+    // Register kernel module stubs
+    register_hal_apis(api_);
+    register_fltmgr_apis(api_);
+    register_cng_apis(api_);
+
+    // Set sample name for behavior report
+    report_->set_sample_name(path);
 
     // Set up a sentinel hit handler: when CPU executes a sentinel address,
     // we intercept and route to the API dispatcher.
@@ -254,6 +317,9 @@ LoadedModule VXEngine::load(const std::string& path) {
         vmem_.write32(winenv_->peb_addr() + 0x08,
                       static_cast<uint32_t>(mod.base));
     }
+
+    // Store the loaded module for later use (unpack, export, etc.)
+    loaded_mod_ = mod;
 
     return mod;
 }
@@ -536,6 +602,178 @@ void VXEngine::load_init_script() {
 
 void VXEngine::handle_sentinel(uint64_t addr) {
     api_.dispatch(addr);
+}
+
+// ============================================================
+// Shellcode Loader
+// ============================================================
+
+LoadedModule VXEngine::load_shellcode_bytes(const uint8_t* data, size_t size, uint64_t base) {
+    if (base == 0) base = 0x00400000;
+
+    // Align size to page boundary
+    uint64_t aligned_size = (size + PAGE_SIZE - 1) & PAGE_MASK;
+    vmem_.map(base, aligned_size, PERM_RWX);
+    vmem_.write(base, data, size);
+
+    // Set PC to base
+    cpu_->set_pc(base);
+
+    // Create synthetic LoadedModule
+    LoadedModule mod;
+    mod.name = "shellcode";
+    mod.path = "<shellcode>";
+    mod.base = base;
+    mod.size = size;
+    mod.entry_point = base;
+    mod.image_base = base;
+
+    LoadedModule::Section sec;
+    sec.name = ".text";
+    sec.va = base;
+    sec.size = size;
+    sec.raw_size = size;
+    sec.perms = PERM_RWX;
+    mod.sections.push_back(sec);
+
+    // Update PEB
+    if (arch_ == Arch::X86_32 && winenv_) {
+        vmem_.write32(winenv_->peb_addr() + 0x08, static_cast<uint32_t>(base));
+    }
+
+    std::cerr << "[vx] Loaded " << size << " bytes of shellcode at 0x"
+              << std::hex << base << std::dec << "\n";
+    return mod;
+}
+
+LoadedModule VXEngine::load_shellcode(const std::string& path, uint64_t base) {
+    std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+    if (!ifs) {
+        throw std::runtime_error("Failed to open shellcode file: " + path);
+    }
+
+    size_t size = static_cast<size_t>(ifs.tellg());
+    ifs.seekg(0);
+    std::vector<uint8_t> data(size);
+    ifs.read(reinterpret_cast<char*>(data.data()), size);
+
+    auto mod = load_shellcode_bytes(data.data(), data.size(), base);
+    mod.path = path;
+    return mod;
+}
+
+// ============================================================
+// Auto-Unpack
+// ============================================================
+
+bool VXEngine::auto_unpack(const std::string& dump_path) {
+    // Get the currently loaded module info
+    if (!loaded_mod_.has_value()) {
+        std::cerr << "[vx] No modules loaded for unpacking\n";
+        return false;
+    }
+
+    const auto& mod = loaded_mod_.value();
+    Unpacker unpacker(*cpu_, vmem_, loader_);
+    unpacker.arm(mod);
+
+    // Run until OEP detected or instruction limit
+    constexpr uint64_t MAX_INSNS = 50000000; // 50M
+    uint64_t count = 0;
+
+    while (count < MAX_INSNS) {
+        uint64_t pc = cpu_->pc();
+
+        if (unpacker.check(pc)) {
+            auto result = unpacker.dump(dump_path, mod);
+            return result.success;
+        }
+
+        // API sentinel check
+        if (pc >= SENTINEL_BASE && pc < loader_.next_sentinel()) {
+            api_.dispatch(pc);
+            count++;
+            continue;
+        }
+
+        StepResult sr = cpu_->step();
+        count++;
+
+        if (sr.reason == StopReason::EXCEPTION ||
+            sr.reason == StopReason::ERROR ||
+            sr.reason == StopReason::HALT) {
+            std::cerr << "[vx] Unpacker: Execution stopped at 0x"
+                      << std::hex << sr.addr << std::dec << "\n";
+            break;
+        }
+    }
+
+    if (count >= MAX_INSNS) {
+        std::cerr << "[vx] Unpacker: Instruction limit reached without OEP detection\n";
+    }
+    return false;
+}
+
+// ============================================================
+// Export Exerciser
+// ============================================================
+
+std::vector<ExportResult> VXEngine::exercise_exports() {
+    std::vector<ExportResult> results;
+
+    if (!loaded_mod_.has_value()) return results;
+
+    const auto& mod = loaded_mod_.value();
+    if (mod.exports.empty()) return results;
+
+    // Save CPU state
+    uint64_t saved_pc = cpu_->pc();
+    uint64_t saved_sp = cpu_->sp();
+    uint64_t saved_eax = cpu_->reg(X86_EAX);
+
+    for (const auto& exp : mod.exports) {
+        ExportResult er;
+        er.name = exp.name;
+        er.address = exp.addr;
+
+        // Restore stack pointer
+        cpu_->set_sp(saved_sp);
+
+        try {
+            // Call with 4 zero args, 100k instruction limit
+            call(exp.addr, {0, 0, 0, 0});
+            er.completed = true;
+            er.stop_reason = StopReason::HALT;
+        } catch (...) {
+            er.completed = false;
+            er.stop_reason = StopReason::ERROR;
+        }
+
+        results.push_back(er);
+        std::cerr << "[vx] Export '" << exp.name << "' @ 0x" << std::hex
+                  << exp.addr << ": " << (er.completed ? "OK" : "FAIL")
+                  << std::dec << "\n";
+    }
+
+    // Restore CPU state
+    cpu_->set_pc(saved_pc);
+    cpu_->set_sp(saved_sp);
+    cpu_->set_reg(X86_EAX, saved_eax);
+
+    return results;
+}
+
+// ============================================================
+// PE Writer (Export for Debugger)
+// ============================================================
+
+bool VXEngine::export_for_debugger(const std::string& path, uint64_t oep) {
+    if (!loaded_mod_.has_value()) {
+        std::cerr << "[vx] No modules loaded for export\n";
+        return false;
+    }
+
+    return PEWriter::write(path, vmem_, loaded_mod_.value(), oep, loader_.sentinel_map());
 }
 
 } // namespace vx

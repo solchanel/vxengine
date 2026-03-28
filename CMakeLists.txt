@@ -96,10 +96,26 @@ set(VX_CORE_SOURCES
     src/elf_loader.cpp
     src/exception_handler.cpp
     src/thread_manager.cpp
+    src/behavior_report.cpp
     src/kernel_env.cpp
     src/win_api_ntoskrnl.cpp
     src/win_api_extended.cpp
     src/win_api_ntdll.cpp
+    src/win_api_advapi32.cpp
+    src/win_api_ws2_32.cpp
+    src/vfs.cpp
+    src/win_api_vfs.cpp
+    src/win_api_wininet.cpp
+    src/win_api_winhttp.cpp
+    src/win_api_user32.cpp
+    src/win_api_crypt32.cpp
+    src/win_api_ole32.cpp
+    src/win_api_advapi32_security.cpp
+    src/win_api_hal.cpp
+    src/win_api_fltmgr.cpp
+    src/win_api_cng.cpp
+    src/unpacker.cpp
+    src/pe_writer.cpp
 )
 
 # JIT is Phase 2 — stub file not yet implemented
